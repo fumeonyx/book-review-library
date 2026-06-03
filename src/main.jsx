@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import { sampleBooks } from './sampleBooks'
@@ -72,6 +72,10 @@ function RatingLine({ label, value }) {
       <Score value={value} />
     </div>
   )
+}
+
+function isLovedBook(book) {
+  return Boolean(book?.is_favorite) || Number(book?.rating_total) >= 4.5
 }
 
 function GeneratedCover({ book }) {
@@ -154,7 +158,7 @@ function BookSpine({ book, onOpen, index }) {
       onClick={() => onOpen(book)}
       title={`${book.title} — ${book.author}`}
     >
-      {book.is_favorite && <span className="favoritePin">♥</span>}
+      {isLovedBook(book) && <span className="favoritePin" aria-label="Любимая книга">♥</span>}
       <span className="bookTitle">{book.title}</span>
       <span className="bookAuthor">{book.author}</span>
     </button>
@@ -185,28 +189,41 @@ function Shelf({ title, books, onOpen, emptyText, variant = 'default' }) {
 }
 
 function normalizeFileName(text) {
-  return text
+  return String(text || '')
     .toLowerCase()
-    .replace(/[^a-zа-яё0-9]+/gi, '-')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 60) || 'book-cover'
+    .slice(0, 42) || 'cover'
 }
 
-async function uploadCover(file, title) {
+async function uploadCover(file, title, userId, bookId) {
   if (!file) return ''
+  if (!supabase) throw new Error('Supabase не подключён')
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) throw new Error('Обложка должна быть JPG, PNG или WEBP')
   if (file.size > 2 * 1024 * 1024) throw new Error('Файл обложки слишком большой. Лучше до 2 МБ')
 
   const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg'
-  const filePath = `${Date.now()}-${normalizeFileName(title)}.${ext}`
-  const { error } = await supabase.storage.from(COVER_BUCKET).upload(filePath, file, {
-    cacheControl: '3600',
-    upsert: false,
-  })
-  if (error) throw error
+  const safeUser = normalizeFileName(userId || 'admin')
+  const safeBook = normalizeFileName(bookId || title || 'book')
+  const filePath = `${safeUser}/${safeBook}/${Date.now()}-cover.${ext}`
 
-  const { data } = supabase.storage.from(COVER_BUCKET).getPublicUrl(filePath)
-  return data.publicUrl
+  const { data: uploadData, error: uploadError } = await supabase.storage
+    .from(COVER_BUCKET)
+    .upload(filePath, file, {
+      cacheControl: '3600',
+      upsert: true,
+      contentType: file.type,
+    })
+
+  if (uploadError) {
+    throw new Error(`Не удалось загрузить обложку в Storage: ${uploadError.message}`)
+  }
+
+  const { data } = supabase.storage.from(COVER_BUCKET).getPublicUrl(uploadData?.path || filePath)
+  if (!data?.publicUrl) throw new Error('Supabase не вернул ссылку на обложку')
+  return `${data.publicUrl}?v=${Date.now()}`
 }
 
 function formFromBook(book) {
@@ -224,7 +241,7 @@ function formFromBook(book) {
   }
 }
 
-function AdminPanel({ books, onBookChanged }) {
+function AdminPanel({ books, onBookChanged, dataSource, dbError }) {
   const [session, setSession] = useState(null)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -234,6 +251,7 @@ function AdminPanel({ books, onBookChanged }) {
   const [jsonImport, setJsonImport] = useState('')
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
+  const coverInputRef = useRef(null)
 
   useEffect(() => {
     if (!supabase) return
@@ -289,22 +307,39 @@ function AdminPanel({ books, onBookChanged }) {
 
   async function saveBook(event) {
     event.preventDefault()
+    if (dataSource !== 'supabase') {
+      setMessage('Нельзя сохранить: Supabase не загрузился, сейчас открыта локальная копия книг. Попробуй другой браузер или отключи QUIC/блокировку сети.')
+      return
+    }
     setLoading(true)
-    setMessage('')
+    setMessage('Проверяю данные...')
     try {
-      const uploadedCoverUrl = coverFile ? await uploadCover(coverFile, form.title) : ''
+      const selectedCover = coverFile || coverInputRef.current?.files?.[0] || null
+      let uploadedCoverUrl = ''
+
+      if (selectedCover) {
+        setMessage(`Загружаю обложку «${selectedCover.name}»...`)
+        uploadedCoverUrl = await uploadCover(selectedCover, form.title, session?.user?.id, editingId || 'new-book')
+        setMessage('Обложка загружена. Сохраняю книгу...')
+      } else {
+        setMessage(editingId ? 'Сохраняю изменения без замены обложки...' : 'Сохраняю книгу без обложки...')
+      }
+
+      const wasEditing = Boolean(editingId)
       const payload = preparePayload(form, uploadedCoverUrl)
       const request = editingId
-        ? supabase.from('books').update(payload).eq('id', editingId)
-        : supabase.from('books').insert(payload)
-      const { error } = await request
+        ? supabase.from('books').update(payload).eq('id', editingId).select('*').single()
+        : supabase.from('books').insert(payload).select('*').single()
+      const { data, error } = await request
       if (error) throw error
+      if (!data?.id) throw new Error('Supabase не вернул сохранённую книгу. Проверь, что запись есть в Table Editor → books.')
+
       setForm(emptyForm)
       setEditingId(null)
       setCoverFile(null)
-      event.currentTarget.reset()
-      setMessage(editingId ? 'Книга обновлена ✨' : 'Книга добавлена ✨')
-      onBookChanged()
+      if (coverInputRef.current) coverInputRef.current.value = ''
+      setMessage(uploadedCoverUrl ? 'Книга обновлена, обложка привязана ✨' : wasEditing ? 'Книга обновлена ✨' : 'Книга добавлена ✨')
+      await onBookChanged()
     } catch (error) {
       setMessage(`Ошибка сохранения: ${error.message}`)
     } finally {
@@ -316,7 +351,8 @@ function AdminPanel({ books, onBookChanged }) {
     setEditingId(book.id)
     setForm(formFromBook(book))
     setCoverFile(null)
-    setMessage('Редактируешь книгу. Новую обложку можно не выбирать — старая останется.')
+    if (coverInputRef.current) coverInputRef.current.value = ''
+    setMessage('Редактируешь книгу. Если выберешь новый файл, он загрузится в Supabase Storage и заменит текущую обложку.')
     setTimeout(() => document.querySelector('.adminBox')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
   }
 
@@ -324,6 +360,7 @@ function AdminPanel({ books, onBookChanged }) {
     setEditingId(null)
     setForm(emptyForm)
     setCoverFile(null)
+    if (coverInputRef.current) coverInputRef.current.value = ''
     setMessage('Редактирование отменено')
   }
 
@@ -398,6 +435,15 @@ function AdminPanel({ books, onBookChanged }) {
         <button className="smallButton" onClick={signOut}>Выйти</button>
       </div>
 
+      {message && <p className="formMessage stickyMessage">{message}</p>}
+
+      {dataSource !== 'supabase' && (
+        <div className="adminWarning">
+          Сейчас сайт показывает локальные книги, потому что Supabase не загрузился. Редактирование и загрузка обложек будут работать только после восстановления соединения с Supabase.
+          {dbError && <code>{dbError}</code>}
+        </div>
+      )}
+
       <form className="bookForm" onSubmit={saveBook}>
         <input required value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="Название" />
         <input required value={form.author} onChange={(event) => setForm({ ...form, author: event.target.value })} placeholder="Автор" />
@@ -413,8 +459,22 @@ function AdminPanel({ books, onBookChanged }) {
 
         <label className="fileField">
           <span>{editingId ? 'Заменить обложку, если нужно' : 'Обложка JPG/PNG/WEBP до 2 МБ'}</span>
-          <input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => setCoverFile(event.target.files?.[0] || null)} />
+          <input
+            ref={coverInputRef}
+            name="coverFile"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            onChange={(event) => setCoverFile(event.target.files?.[0] || null)}
+          />
+          <em>{coverFile ? `Выбран файл: ${coverFile.name}` : 'Файл не выбран'}</em>
         </label>
+
+        {editingId && form.cover_url && (
+          <div className="currentCoverNote">
+            <span>Текущая обложка:</span>
+            <code>{form.cover_url.startsWith('http') ? 'Supabase Storage' : form.cover_url}</code>
+          </div>
+        )}
 
         <label className="colorField">Цвет корешка <input value={form.spine_color} onChange={(event) => setForm({ ...form, spine_color: event.target.value })} type="color" /></label>
         <label className="checkboxField"><input checked={form.is_favorite} onChange={(event) => setForm({ ...form, is_favorite: event.target.checked })} type="checkbox" /> Любимая книга</label>
@@ -476,20 +536,29 @@ function App() {
   const [selectedBook, setSelectedBook] = useState(null)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(false)
+  const [dataSource, setDataSource] = useState('local')
+  const [dbError, setDbError] = useState('')
   
   async function loadBooks() {
     if (!supabase) {
+      setDataSource('local')
+      setDbError('Supabase не настроен')
       setBooks(sampleBooks)
       return
     }
     setLoading(true)
+    setDbError('')
     const { data, error } = await supabase.from('books').select('*').order('title', { ascending: true })
     setLoading(false)
     if (error) {
       console.warn('Supabase load failed, using local books:', error.message)
+      setDataSource('local')
+      setDbError(error.message)
       setBooks(sampleBooks)
       return
     }
+    setDataSource('supabase')
+    setDbError('')
     setBooks(data?.length ? data : sampleBooks)
   }
 
@@ -504,7 +573,7 @@ function App() {
       .sort((a, b) => (a.title || '').localeCompare(b.title || '', 'ru'))
   }, [books, search])
 
-  const favoriteBooks = filteredBooks.filter((book) => book.is_favorite || Number(book.rating_total) >= 4.5)
+  const favoriteBooks = filteredBooks.filter(isLovedBook)
   const genres = [...new Set(filteredBooks.map((book) => book.genre || 'Без жанра'))]
   const averageRating = books.length
     ? (books.reduce((sum, book) => sum + (Number(book.rating_total) || 0), 0) / books.length).toFixed(1).replace('.', ',')
@@ -529,12 +598,13 @@ function App() {
       </section>
 
       {loading && <p className="systemMessage">Загружаю книги...</p>}
+      {dataSource !== 'supabase' && dbError && <p className="systemMessage warning">Supabase не загрузился: {dbError}. Сейчас показана локальная копия, сохранение и обложки не работают.</p>}
       <Shelf title="Любимые книги" books={favoriteBooks} onOpen={setSelectedBook} emptyText="Пока нет любимых книг." variant="favorite" />
       {genres.map((genre) => (
         <Shelf key={genre} title={genre} books={filteredBooks.filter((book) => (book.genre || 'Без жанра') === genre)} onOpen={setSelectedBook} emptyText="На этой полке пока пусто." variant={genre.toLowerCase()} />
       ))}
 
-      <AdminPanel books={books} onBookChanged={loadBooks} />
+      <AdminPanel books={books} onBookChanged={loadBooks} dataSource={dataSource} dbError={dbError} />
       <BookModal book={selectedBook} onClose={() => setSelectedBook(null)} />
     </main>
   )

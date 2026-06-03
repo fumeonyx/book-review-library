@@ -1,7 +1,7 @@
 {
   "name": "book-review-library",
   "private": true,
-  "version": "9.0.0",
+  "version": "14.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
